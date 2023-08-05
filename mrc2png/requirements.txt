@@ -1,3 +1,0 @@
-mrcfile
-imageio
-pytest-shutil
