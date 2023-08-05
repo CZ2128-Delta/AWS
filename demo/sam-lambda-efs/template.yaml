@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  sam-lambda-efs
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 4096
+    Tracing: Active
+  Api:
+    TracingEnabled: true
+
+Parameters:
+  MrcBucketName:
+    Type: String
+    Default: mrcbucket123
+
+Resources:
+  # Configure VPC, Security Group, Subnets #
+  EfsLambdaVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      Tags:
+      - Key: Name
+        Value: EfsLambdaVpc
+
+  EfsLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS + Lambda on SAM Security Group
+      VpcId: !Ref EfsLambdaVpc
+      SecurityGroupEgress:
+      - CidrIp: 0.0.0.0/0
+        FromPort: 0
+        ToPort: 65535
+        IpProtocol: tcp
+      SecurityGroupIngress:
+      - CidrIp: 0.0.0.0/0
+        FromPort: 0
+        ToPort: 65535
+        IpProtocol: tcp
+
+  PublicSubset:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EfsLambdaVpc
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+
+  EfsLambdaSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EfsLambdaVpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      CidrBlock: 10.0.0.0/24
+
+  EfsLambdaSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EfsLambdaVpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      CidrBlock: 10.0.1.0/24
+
+  # Configure Internet Gateway #
+  EfsLambdaInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: EfsLambdaInternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref EfsLambdaVpc
+      InternetGatewayId: !Ref EfsLambdaInternetGateway
+
+  # Configure NAT Gateway In Public Subnet #
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt [NatGatewayEIP, AllocationId]
+      SubnetId: !Ref PublicSubset
+
+  # Configure Routes Of Subnets #
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EfsLambdaVpc
+      Tags:
+      - Key: Name
+        Value: PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EfsLambdaVpc
+      Tags:
+      - Key: Name
+        Value: PrivateRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref EfsLambdaInternetGateway
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  AssociationPublicSubnet:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubset
+      RouteTableId: !Ref PublicRouteTable
+
+  AssociationSubnetA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref EfsLambdaSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  AssociationSubnetB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref EfsLambdaSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Configure EFS #
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref EfsLambdaSubnetA
+      SecurityGroups:
+      - !Ref EfsLambdaSecurityGroup
+
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref EfsLambdaSubnetB
+      SecurityGroups:
+      - !Ref EfsLambdaSecurityGroup
+
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      PosixUser:
+        Gid: '1000'
+        Uid: '1000'
+      RootDirectory:
+        Path: /lambda
+        CreationInfo:
+          OwnerGid: '1000'
+          OwnerUid: '1000'
+          Permissions: '777'
+
+  # Configure S3 Bucket #
+  SourceMrcBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref MrcBucketName
+
+  # Configure Lambda Function #
+  HelloEfsFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+    - MountTargetA
+    - MountTargetB
+    Properties:
+      CodeUri: hello_efs/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Architectures:
+      - x86_64
+      Policies:
+      - S3FullAccessPolicy:
+          BucketName: !Ref MrcBucketName
+      - EFSWriteAccessPolicy:
+          FileSystem: !Ref EfsFileSystem
+          AccessPoint: !Ref AccessPoint
+      VpcConfig:
+        SecurityGroupIds:
+        - !Ref EfsLambdaSecurityGroup
+        SubnetIds:
+        - !Ref EfsLambdaSubnetA
+        - !Ref EfsLambdaSubnetB
+      FileSystemConfigs:
+      - Arn: !GetAtt AccessPoint.Arn
+        LocalMountPath: /mnt/lambda
+      Events:
+        S3UploadMrcEvent:
+          Type: S3
+          Properties:
+            Bucket: !Ref SourceMrcBucket
+            Events:
+            - 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                - Name: suffix
+                  Value: .mrc
+
+  # Enable Monitoring Using CloudWatch Application Insights #
+  ApplicationResourceGroup:
+    Type: AWS::ResourceGroups::Group
+    Properties:
+      Name:
+        Fn::Sub: ApplicationInsights-SAM-${AWS::StackName}
+      ResourceQuery:
+        Type: CLOUDFORMATION_STACK_1_0
+  ApplicationInsightsMonitoring:
+    Type: AWS::ApplicationInsights::Application
+    Properties:
+      ResourceGroupName:
+        Ref: ApplicationResourceGroup
+      AutoConfigurationEnabled: 'true'
